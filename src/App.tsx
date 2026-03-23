@@ -3,7 +3,40 @@ import { CartProvider, Product, useCart } from './context/CartContext';
 import { CountdownTimer } from './components/CountdownTimer';
 import { ProductCard } from './components/ProductCard';
 import { CartDrawer } from './components/CartDrawer';
-import { ShoppingBag, Zap, RefreshCw } from 'lucide-react';
+import { ShoppingBag, Zap, RefreshCw, LogIn, LogOut } from 'lucide-react';
+import { db, auth } from './firebase';
+import { collection, onSnapshot, doc, runTransaction, writeBatch, getDocs } from 'firebase/firestore';
+import { signInWithPopup, GoogleAuthProvider, signOut, onAuthStateChanged, User } from 'firebase/auth';
+
+const INITIAL_PRODUCTS = [
+  {
+    id: "p1",
+    name: "Quantum X Pro Smartphone",
+    description: "Next-gen smartphone with quantum processor.",
+    price: 999,
+    stock: 10,
+    originalPrice: 1299,
+    image: "https://picsum.photos/seed/phone/400/400",
+  },
+  {
+    id: "p2",
+    name: "AeroGlide Wireless Headphones",
+    description: "Noise-cancelling over-ear headphones.",
+    price: 149,
+    stock: 5,
+    originalPrice: 299,
+    image: "https://picsum.photos/seed/headphones/400/400",
+  },
+  {
+    id: "p3",
+    name: "Titanium Smart Watch",
+    description: "Rugged smartwatch with 30-day battery life.",
+    price: 199,
+    stock: 2,
+    originalPrice: 349,
+    image: "https://picsum.photos/seed/watch/400/400",
+  },
+];
 
 function AppContent() {
   const [products, setProducts] = useState<Product[]>([]);
@@ -11,6 +44,7 @@ function AppContent() {
   const [isCartOpen, setIsCartOpen] = useState(false);
   const [isCheckingOut, setIsCheckingOut] = useState(false);
   const [checkoutMessage, setCheckoutMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null);
+  const [user, setUser] = useState<User | null>(null);
   
   const { cart, itemCount, clearCart } = useCart();
 
@@ -18,26 +52,63 @@ function AppContent() {
   const [saleEndTime] = useState(() => new Date(Date.now() + 60 * 60 * 1000));
   const isSaleActive = new Date() < saleEndTime;
 
-  const fetchProducts = async () => {
-    setIsLoading(true);
-    try {
-      const response = await fetch('/api/products');
-      const data = await response.json();
-      setProducts(data);
-    } catch (error) {
-      console.error('Failed to fetch products:', error);
-    } finally {
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    // Real-time listener for products
+    const unsubscribe = onSnapshot(collection(db, 'products'), (snapshot) => {
+      if (snapshot.empty) {
+        setProducts([]);
+        setIsLoading(false);
+      } else {
+        const productsData = snapshot.docs.map(doc => ({
+          id: doc.id,
+          ...doc.data()
+        })) as Product[];
+        // Sort by ID to keep order consistent
+        productsData.sort((a, b) => a.id.localeCompare(b.id));
+        setProducts(productsData);
+        setIsLoading(false);
+      }
+    }, (error) => {
+      console.error("Error fetching products:", error);
       setIsLoading(false);
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  const seedDatabase = async () => {
+    try {
+      const batch = writeBatch(db);
+      INITIAL_PRODUCTS.forEach(product => {
+        const docRef = doc(db, 'products', product.id);
+        const { id, ...productData } = product;
+        batch.set(docRef, productData);
+      });
+      await batch.commit();
+      setCheckoutMessage({ type: 'success', text: 'Database seeded successfully!' });
+      setTimeout(() => setCheckoutMessage(null), 3000);
+    } catch (error: any) {
+      console.error("Error seeding database:", error);
+      setCheckoutMessage({ type: 'error', text: error.message || 'Failed to seed database.' });
     }
   };
 
-  useEffect(() => {
-    fetchProducts();
-    
-    // Poll for inventory updates every 5 seconds
-    const interval = setInterval(fetchProducts, 5000);
-    return () => clearInterval(interval);
-  }, []);
+  const handleLogin = () => {
+    signInWithPopup(auth, new GoogleAuthProvider()).catch(console.error);
+  };
+
+  const handleLogout = () => {
+    signOut(auth).catch(console.error);
+  };
+
+  const isAdmin = user?.email === 'nicokie0420@gmail.com';
 
   const handleCheckout = async () => {
     if (cart.length === 0) return;
@@ -46,35 +117,59 @@ function AppContent() {
     setCheckoutMessage(null);
 
     try {
-      const response = await fetch('/api/checkout', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          items: cart.map(item => ({ productId: item.id, quantity: item.quantity })),
-        }),
+      await runTransaction(db, async (transaction) => {
+        // 1. Read all product documents first (Firestore requirement)
+        const productRefs = cart.map(item => doc(db, 'products', item.id));
+        const productDocs = await Promise.all(productRefs.map(ref => transaction.get(ref)));
+        
+        const updates = [];
+        const errors = [];
+
+        // 2. Check stock for all items
+        for (let i = 0; i < cart.length; i++) {
+          const item = cart[i];
+          const productDoc = productDocs[i];
+          
+          if (!productDoc.exists()) {
+            errors.push(`Product ${item.name} not found.`);
+            continue;
+          }
+          
+          const currentStock = productDoc.data().stock;
+          if (currentStock < item.quantity) {
+            errors.push(`Not enough stock for ${item.name}. Only ${currentStock} left.`);
+          } else {
+            updates.push({
+              ref: productRefs[i],
+              newStock: currentStock - item.quantity
+            });
+          }
+        }
+
+        if (errors.length > 0) {
+          throw new Error(errors.join(' | '));
+        }
+
+        // 3. Apply all updates
+        updates.forEach(update => {
+          transaction.update(update.ref, { stock: update.newStock });
+        });
       });
 
-      const data = await response.json();
+      // Transaction successful
+      setCheckoutMessage({ type: 'success', text: 'Order placed successfully! Items secured.' });
+      clearCart();
+      setTimeout(() => {
+        setIsCartOpen(false);
+        setCheckoutMessage(null);
+      }, 3000);
 
-      if (response.ok) {
-        setCheckoutMessage({ type: 'success', text: 'Order placed successfully! Items secured.' });
-        clearCart();
-        fetchProducts(); // Refresh inventory immediately
-        setTimeout(() => {
-          setIsCartOpen(false);
-          setCheckoutMessage(null);
-        }, 3000);
-      } else {
-        setCheckoutMessage({ 
-          type: 'error', 
-          text: data.details ? data.details.join(', ') : data.error || 'Checkout failed' 
-        });
-        fetchProducts(); // Refresh inventory to show what's out of stock
-      }
-    } catch (error) {
-      setCheckoutMessage({ type: 'error', text: 'Network error during checkout. Please try again.' });
+    } catch (error: any) {
+      console.error("Checkout failed:", error);
+      setCheckoutMessage({ 
+        type: 'error', 
+        text: error.message || 'Checkout failed due to high traffic. Please try again.' 
+      });
     } finally {
       setIsCheckingOut(false);
     }
@@ -82,12 +177,18 @@ function AppContent() {
 
   const resetInventory = async () => {
     try {
-      await fetch('/api/admin/reset', { method: 'POST' });
-      fetchProducts();
+      const batch = writeBatch(db);
+      INITIAL_PRODUCTS.forEach(product => {
+        const docRef = doc(db, 'products', product.id);
+        batch.update(docRef, { stock: product.stock });
+      });
+      await batch.commit();
       setCheckoutMessage({ type: 'success', text: 'Inventory reset for testing.' });
       setTimeout(() => setCheckoutMessage(null), 3000);
     } catch (error) {
       console.error('Failed to reset inventory', error);
+      // Fallback to seed if documents don't exist
+      seedDatabase();
     }
   };
 
@@ -107,13 +208,33 @@ function AppContent() {
             </div>
             
             <div className="flex items-center gap-4">
-              <button 
-                onClick={resetInventory}
-                className="hidden sm:flex items-center gap-2 text-sm font-medium text-slate-500 hover:text-slate-900 transition-colors"
-              >
-                <RefreshCw className="w-4 h-4" />
-                Reset Stock
-              </button>
+              {isAdmin && (
+                <button 
+                  onClick={resetInventory}
+                  className="hidden sm:flex items-center gap-2 text-sm font-medium text-slate-500 hover:text-slate-900 transition-colors"
+                >
+                  <RefreshCw className="w-4 h-4" />
+                  Reset Stock
+                </button>
+              )}
+              
+              {user ? (
+                <button 
+                  onClick={handleLogout}
+                  className="hidden sm:flex items-center gap-2 text-sm font-medium text-slate-500 hover:text-slate-900 transition-colors"
+                >
+                  <LogOut className="w-4 h-4" />
+                  Logout
+                </button>
+              ) : (
+                <button 
+                  onClick={handleLogin}
+                  className="hidden sm:flex items-center gap-2 text-sm font-medium text-indigo-600 hover:text-indigo-700 transition-colors"
+                >
+                  <LogIn className="w-4 h-4" />
+                  Admin Login
+                </button>
+              )}
               
               <button 
                 onClick={() => setIsCartOpen(true)}
@@ -160,9 +281,27 @@ function AppContent() {
         )}
 
         {/* Product Grid */}
-        {isLoading && products.length === 0 ? (
+        {isLoading ? (
           <div className="flex justify-center items-center h-64">
             <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-600"></div>
+          </div>
+        ) : products.length === 0 ? (
+          <div className="text-center py-12 bg-white rounded-2xl shadow-sm border border-slate-200">
+            <h2 className="text-2xl font-bold text-slate-900 mb-4">No products available</h2>
+            <p className="text-slate-600 mb-6">The flash sale catalog is currently empty.</p>
+            {isAdmin ? (
+              <button 
+                onClick={seedDatabase} 
+                className="bg-indigo-600 text-white px-6 py-3 rounded-xl font-medium hover:bg-indigo-700 transition-colors inline-flex items-center gap-2"
+              >
+                <Zap className="w-5 h-5" />
+                Initialize Store Database
+              </button>
+            ) : (
+              <p className="text-sm text-amber-600 bg-amber-50 inline-block px-4 py-2 rounded-lg">
+                Please log in as the administrator (nicokie0420@gmail.com) to initialize the store.
+              </p>
+            )}
           </div>
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6 xl:gap-8">

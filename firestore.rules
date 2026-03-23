@@ -1,0 +1,115 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: products
+    // Document ID: auto-generated or custom string
+    // Fields:
+    //   - name: string (required)
+    //   - description: string (required)
+    //   - price: number (required, positive)
+    //   - stock: number (required, >= 0)
+    //   - originalPrice: number (required, positive)
+    //   - image: string (required, url)
+    //
+    // Collection: orders
+    // Document ID: auto-generated
+    // Fields:
+    //   - userId: string (required)
+    //   - items: list (required)
+    //   - total: number (required, positive)
+    //   - createdAt: timestamp (required)
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      // For this demo, we'll allow a specific admin email or just anyone to reset if they know the secret,
+      // but to be secure, we'll check if the user's email is the owner's email.
+      return isAuthenticated() && request.auth.token.email == "nicokie0420@gmail.com" && request.auth.token.email_verified == true;
+    }
+
+    function hasOnlyAllowedFields(allowedFields) {
+      return request.resource.data.keys().hasOnly(allowedFields);
+    }
+
+    function hasRequiredFields(requiredFields) {
+      return request.resource.data.keys().hasAll(requiredFields);
+    }
+
+    function isValidUrl(url) {
+      return url is string && (url.matches("^https://.*") || url.matches("^http://.*"));
+    }
+
+    function isValidProduct(data) {
+      return hasOnlyAllowedFields(['name', 'description', 'price', 'stock', 'originalPrice', 'image']) &&
+             hasRequiredFields(['name', 'description', 'price', 'stock', 'originalPrice', 'image']) &&
+             data.name is string && data.name.size() > 0 && data.name.size() < 100 &&
+             data.description is string && data.description.size() < 1000 &&
+             data.price is number && data.price >= 0 &&
+             data.stock is number && data.stock >= 0 &&
+             data.originalPrice is number && data.originalPrice >= 0 &&
+             isValidUrl(data.image);
+    }
+
+    function isValidOrder(data) {
+      return hasOnlyAllowedFields(['userId', 'items', 'total', 'createdAt']) &&
+             hasRequiredFields(['userId', 'items', 'total', 'createdAt']) &&
+             data.userId is string && data.userId.size() > 0 && data.userId.size() < 100 &&
+             data.items is list && data.items.size() > 0 && data.items.size() <= 50 &&
+             data.total is number && data.total >= 0 &&
+             data.createdAt is timestamp;
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /products/{productId} {
+      // Anyone can read products (public catalog)
+      allow read: if true;
+      
+      // Only admins can create or delete products
+      allow create, delete: if isAdmin() && isValidProduct(request.resource.data);
+      
+      // Updates:
+      // 1. Admins can update anything as long as it's a valid product.
+      // 2. Regular users (even unauthenticated for this demo, or authenticated) can ONLY decrement stock.
+      allow update: if 
+        (isAdmin() && isValidProduct(request.resource.data)) ||
+        (
+          // Allow users to decrement stock during checkout
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['stock']) &&
+          request.resource.data.stock is number &&
+          request.resource.data.stock >= 0 &&
+          request.resource.data.stock < resource.data.stock // Must be a decrement
+        );
+    }
+
+    match /orders/{orderId} {
+      // Users can read their own orders, admins can read all
+      allow read: if isAdmin() || (isAuthenticated() && resource.data.userId == request.auth.uid);
+      
+      // Anyone can create an order (even anonymous users, if we use anonymous auth, but let's require auth)
+      // Wait, for a flash sale, we might want to allow anonymous checkouts. Let's allow anyone to create an order
+      // as long as the data is valid and they set the userId to their own uid (if authenticated) or a session ID.
+      allow create: if isValidOrder(request.resource.data) && 
+                    (!isAuthenticated() || request.resource.data.userId == request.auth.uid);
+      
+      // Orders cannot be updated or deleted
+      allow update, delete: if false;
+    }
+  }
+}
